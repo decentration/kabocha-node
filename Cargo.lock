@@ -234,11 +234,7 @@ dependencies = [
  "parking",
  "polling",
  "slab",
- "socket2 0.4.2",
  "waker-fn",
- "winapi 0.3.9",
-]
-
 [[package]]
 name = "async-lock"
 version = "2.4.0"
@@ -340,11 +336,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb4401f0a3622dad2e0763fa79e0eb328bc70fb7dccfdd645341f00d671247d6"
 dependencies = [
- "bytes 1.1.0",
  "futures-sink",
- "futures-util",
- "memchr",
- "pin-project-lite 0.2.7",
 ]
 
 [[package]]

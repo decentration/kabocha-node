@@ -127,7 +127,8 @@ pub(crate) mod tests;
 mod inflation;
 mod set;
 mod types;
-
+mod conviction;
+pub use conviction::Conviction;
 use frame_support::pallet;
 
 pub use crate::{default_weights::WeightInfo, pallet::*};
@@ -309,6 +310,9 @@ pub mod pallet {
 		type WeightInfo: WeightInfo;
 
 		const BLOCKS_PER_YEAR: Self::BlockNumber;
+
+		#[pallet::constant]
+		type MaxStake: Get<u32>;
 	}
 
 	#[pallet::error]
@@ -400,6 +404,11 @@ pub mod pallet {
 		StakeNotFound,
 		/// Cannot unlock when Unstaked is empty.
 		UnstakingIsEmpty,
+		/// Already following delegator
+		AlreadyFollowingDelegator
+		/// Already unfollowing delegator
+		AlreadyUnfollowedDelegator
+		
 	}
 
 	#[pallet::event]
@@ -462,14 +471,7 @@ pub mod pallet {
 		/// account, amount of funds staked in the replace delegation, collator
 		/// candidate's account, new total amount of delegators' funds staked
 		/// for the collator candidate\]
-		DelegationReplaced(
-			T::AccountId,
-			BalanceOf<T>,
-			T::AccountId,
-			BalanceOf<T>,
-			T::AccountId,
-			BalanceOf<T>,
-		),
+		DelegationReplaced(T::AccountId, BalanceOf<T>, T::AccountId, BalanceOf<T>, T::AccountId, BalanceOf<T>),
 		/// An account has stopped delegating a collator candidate.
 		/// \[account, collator candidate's account, old amount of delegators'
 		/// funds staked, new amount of delegators' funds staked\]
@@ -488,6 +490,10 @@ pub mod pallet {
 		/// \[round number, first block in the current round, old value, new
 		/// value\]
 		BlocksPerRoundSet(SessionIndex, T::BlockNumber, T::BlockNumber, T::BlockNumber),
+		/// An account has delegated their vote to another account.
+		Followed { who: T::AccountId, target: T::AccountId },
+		/// An account has cancelled a previous delegation operation.
+		Unfollowed { account: T::AccountId },
 	}
 
 	#[pallet::hooks]
@@ -1434,13 +1440,19 @@ pub mod pallet {
 			T::MaxTopCandidates::get(),
 			T::MaxDelegatorsPerCollator::get()
 		))]
-		pub fn join_delegators(
-			origin: OriginFor<T>,
+		pub fn join_delegators( 
+
+			origin: OriginFor<T>, 
+			amount: BalanceOf<T>, 
 			collator: <T::Lookup as StaticLookup>::Source,
-			amount: BalanceOf<T>,
-		) -> DispatchResultWithPostInfo {
+			// select from list of delegators and follow their actions
+			follow: <T::Lookup as StaticLookup>::Source,
+		)
+		-> DispatchResultWithPostInfo {
+			
 			let acc = ensure_signed(origin)?;
 			let collator = T::Lookup::lookup(collator)?;
+			let follow = T::Lookup::lookup(follow)?;
 
 			// check balance
 			ensure!(
@@ -1464,6 +1476,158 @@ pub mod pallet {
 
 			// prepare update of collator state
 			let mut state = CandidatePool::<T>::get(&collator).ok_or(Error::<T>::CandidateNotFound)?;
+			let num_delegations_pre_insertion: u32 = state.delegators.len().saturated_into();
+
+			ensure!(!state.is_leaving(), Error::<T>::CannotDelegateIfLeaving);
+			let delegation = Stake {
+				owner: acc.clone(),
+				amount,
+			};
+
+			// attempt to insert delegator and check for uniqueness
+			// NOTE: excess is handled below because we support replacing a delegator with
+			// fewer stake
+			let insert_delegator = state
+				.delegators
+				// we handle TooManyDelegators error below in do_update_delegator
+				.try_insert(delegation.clone())
+				.unwrap_or(true);
+			// should never fail but let's be safe
+			ensure!(insert_delegator, Error::<T>::DelegatorExists);
+
+			// can only throw if MaxCollatorsPerDelegator is set to 0 which should never
+			// occur in practice, even if the delegator rewards are set to 0
+			let delegator_state = Delegator::try_new(collator.clone(), amount)
+				.map_err(|_| Error::<T>::MaxCollatorsPerDelegatorExceeded)?;
+
+			let CandidateOf::<T, _> {
+				stake: old_stake,
+				total: old_total,
+				..
+			} = state;
+
+			// update state and potentially prepare kicking a delegator with less staked
+			// amount
+			let (state, maybe_kicked_delegator) = if num_delegations_pre_insertion == T::MaxDelegatorsPerCollator::get()
+			{
+				Self::do_update_delegator(delegation, state)?
+			} else {
+				state.total = state.total.saturating_add(amount);
+				(state, None)
+			};
+			let new_total = state.total;
+
+			// *** No Fail except during increase_lock beyond this point ***
+
+			// lock stake
+			Self::increase_lock(&acc, amount, BalanceOf::<T>::zero())?;
+
+			// update top candidates and total amount at stake
+			let n = if state.is_active() {
+				Self::update_top_candidates(
+					collator.clone(),
+					old_stake,
+					// safe because total >= stake
+					old_total - old_stake,
+					state.stake,
+					state.total - state.stake,
+				)
+			} else {
+				0u32
+			};
+
+			// update states
+			CandidatePool::<T>::insert(&collator, state);
+			DelegatorState::<T>::insert(&acc, delegator_state);
+			<LastDelegation<T>>::insert(&acc, delegation_counter);
+
+			// update or clear storage of potentially kicked delegator
+			Self::update_kicked_delegator_storage(maybe_kicked_delegator);
+
+			Self::deposit_event(Event::Delegation(acc, amount, collator, new_total));
+			Ok(Some(<T as pallet::Config>::WeightInfo::join_delegators(
+				n,
+				T::MaxDelegatorsPerCollator::get(),
+			))
+			.into())
+		}
+
+		/// Join the set of delegators and follow and delegator.
+		///
+		/// The account that wants to delegate cannot be part of the collator
+		/// candidates set as well.
+		///
+		/// The caller must _not_ have delegated before. Otherwise,
+		/// `delegate_another_candidate` should be called.
+		///
+		/// The amount staked must be larger than the minimum required to become
+		/// a delegator as set in the pallet's configuration.
+		///
+		/// As only `MaxDelegatorsPerCollator` are allowed to delegate a given
+		/// collator, the amount staked must be larger than the lowest one in
+		/// the current set of delegator for the operation to be meaningful.
+		///
+		/// The collator's total stake as well as the pallet's total stake are
+		/// increased accordingly.
+		///
+		/// Emits `Delegation`.
+		/// Emits `DelegationReplaced` if the candidate has
+		/// `MaxDelegatorsPerCollator` many delegations but this delegator
+		/// staked more than one of the other delegators of this candidate.
+		///
+		/// # <weight>
+		/// Weight: O(N + D) where N is `MaxSelectedCandidates` bounded by
+		/// `MaxTopCandidates` and D is the number of delegators for this
+		/// candidate bounded by `MaxDelegatorsPerCollator`.
+		/// - Reads: [Origin Account], DelegatorState, TopCandidates,
+		///   MaxSelectedCandidates, CandidatePool, LastDelegation, Round
+		/// - Writes: Locks, CandidatePool, DelegatorState, TotalCollatorStake,
+		///   LastDelegation
+		/// # </weight>
+		#[pallet::weight(<T as pallet::Config>::WeightInfo::join_delegators(
+			T::MaxTopCandidates::get(),
+			T::MaxDelegatorsPerCollator::get()
+		))]
+		pub fn join_delegators_and_follow( 
+
+			origin: OriginFor<T>, 
+			amount: BalanceOf<T>, 
+			// select from list of delegators and follow their actions
+			follow: <T::Lookup as StaticLookup>::Source,
+		)
+		-> DispatchResultWithPostInfo {
+			
+			let acc = ensure_signed(origin)?;
+			let follow = T::Lookup::lookup(follow)?;
+
+			// check balance
+			ensure!(
+				pallet_balances::Pallet::<T>::free_balance(acc.clone()) >= amount.into(),
+				pallet_balances::Error::<T>::InsufficientBalance
+			);
+
+			// first delegation
+			ensure!(DelegatorState::<T>::get(&acc).is_none(), Error::<T>::AlreadyDelegating);
+			ensure!(amount >= T::MinDelegatorStake::get(), Error::<T>::NomStakeBelowMin);
+
+			// cannot be a collator candidate and delegator with same AccountId
+			ensure!(Self::is_active_candidate(&acc).is_none(), Error::<T>::CandidateExists);
+			ensure!(
+				Unstaking::<T>::get(&acc).len().saturated_into::<u32>() < T::MaxUnstakeRequests::get(),
+				Error::<T>::CannotJoinBeforeUnlocking
+			);
+			// cannot be a delegator and follow a delegator with same AccountId
+			ensure!(Self::is_delegator(&acc).is_none(), Error::<T>::DelegatorExists);
+			ensure!(
+				Unstaking::<T>::get(&acc).len().saturated_into::<u32>() < T::MaxUnstakeRequests::get(),
+				Error::<T>::CannotJoinBeforeUnlocking
+			);
+			// cannot delegate if number of delegations in this round exceeds
+			// MaxDelegationsPerRound
+			let delegation_counter = Self::get_delegation_counter(&acc)?;
+
+			// prepare update of collator state
+			let mut state = DelegatorPool::<T>::get(&follow).ok_or(Error::<T>::DelegatorNotFound)?;
 			let num_delegations_pre_insertion: u32 = state.delegators.len().saturated_into();
 
 			ensure!(!state.is_leaving(), Error::<T>::CannotDelegateIfLeaving);
@@ -2345,6 +2509,183 @@ pub mod pallet {
 
 			collators.try_into().expect("Did not extend Collators q.e.d.")
 		}
+
+		/// Follow the delegator pointing your balance to their delegators account
+		///
+		/// The balance delegated is locked for as long as it's delegated.
+		///
+		/// The dispatch origin of this call must be _Signed_, and the signing account must be delegating already
+		///  
+		/// - `to`: The account whose staking the `target` account's staking power will follow.
+		///
+		/// - `balance`: The amount of the account's balance to be used in delegating. This must not
+		///   be more than the account's current balance.
+		///
+		/// Emits `Followed`.
+		///
+		/// Weight: `O(R)` where R is the number of referendums the voter delegating to has
+		///   voted on. Weight is charged as if maximum stakes.
+		// NOTE: weight must cover an incorrect staking of origin with max stakes, this is ensure
+		// because a valid follow cover decoding a direct staking with max stakes.
+		#[pallet::weight(T::WeightInfo::follow(T::MaxStake::get()))]
+		pub fn follow(
+			origin: OriginFor<T>,
+			to: T::AccountId,
+			conviction: Conviction,
+			balance: BalanceOf<T>,
+			
+		) -> DispatchResultWithPostInfo {
+			let who = ensure_signed(origin)?;
+			let stake = Self::try_follow(who, to, conviction, balance)?;
+
+			Ok(Some(T::WeightInfo::follow(stake)).into())
+		}
+
+		/// Undfollow the delegator
+		///
+		/// The dispatch origin of this call must be _Signed_ and the signing account must be
+		/// currently following a delegator.
+		///
+		/// Emits `Unfollowed`.
+		///
+		/// Weight: `O(R)` where R is the number of referendums the voter delegating to has
+		///   voted on. Weight is charged as if maximum stakes.
+		// NOTE: weight must cover an incorrect staking of origin with max stakes, this is ensure
+		// because a valid follow cover decoding a direct staking with max stakes.
+		#[pallet::weight(T::WeightInfo::unfollow(T::MaxStake::get()))]
+		pub fn unfollow(origin: OriginFor<T>) -> DispatchResultWithPostInfo {
+			let who = ensure_signed(origin)?;
+			let stake = Self::try_unfollow(who)?;
+			Ok(Some(T::WeightInfo::unfollow(stake)).into())
+		}
+
+
+
+	/// Return the number of stakes for `who`
+	fn increase_upstream_follows(who: &T::AccountId, amount: Delegations<BalanceOf<T>>) -> u32 {
+		StakingOf::<T>::mutate(who, |staking| match staking {
+			Staking::Delegating { follows, .. } => {
+				// We don't support second level delegating, so we don't need to do anything more.
+				*follows = follows.saturating_add(amount);
+				1
+			},
+			Staking::Direct { stakes, follows, .. } => {
+				*follows = follows.saturating_add(amount);
+				for &(ref_index, account_vote) in stakes.iter() {
+					if let AccountStake::Standard { vote, .. } = account_vote {
+						ReferendumInfoOf::<T>::mutate(ref_index, |maybe_info| {
+							if let Some(ReferendumInfo::Ongoing(ref mut status)) = maybe_info {
+								status.tally.increase(vote.aye, amount);
+							}
+						});
+					}
+				}
+				stakes.len() as u32
+			},
+		})
+	}
+
+	/// Return the number of stakes for `who`
+	fn reduce_upstream_follows(who: &T::AccountId, amount: Delegations<BalanceOf<T>>) -> u32 {
+		StakingOf::<T>::mutate(who, |staking| match staking {
+			Staking::Delegating { follows, .. } => {
+				// We don't support second level delegating, so we don't need to do anything more.
+				*follows = follows.saturating_sub(amount);
+				1
+			},
+			Staking::Direct { stakes, follows, .. } => {
+				*follows = follows.saturating_sub(amount);
+				for &(ref_index, account_vote) in stakes.iter() {
+					if let AccountStake::Standard { vote, .. } = account_vote {
+						ReferendumInfoOf::<T>::mutate(ref_index, |maybe_info| {
+							if let Some(ReferendumInfo::Ongoing(ref mut status)) = maybe_info {
+								status.tally.reduce(vote.aye, amount);
+							}
+						});
+					}
+				}
+				stakes.len() as u32
+			},
+		})
+	}
+
+	/// Attempt to delegate `balance` times `conviction` of staking power from `who` to `target`.
+	///
+	/// Return the upstream number of stakes.
+	fn try_follow(
+		who: T::AccountId,
+		target: T::AccountId,
+		balance: BalanceOf<T>,
+	) -> Result<u32, DispatchError> {
+		ensure!(who != target, Error::<T>::Nonsense);
+		ensure!(balance <= T::Currency::free_balance(&who), Error::<T>::InsufficientFunds);
+		let stake = StakingOf::<T>::try_mutate(&who, |staking| -> Result<u32, DispatchError> {
+			let mut old = Staking::Delegating {
+				balance,
+				target: target.clone(),
+				follows: Default::default(),
+				prior: Default::default(),
+			};
+			sp_std::mem::swap(&mut old, staking);
+			match old {
+				Staking::Delegating {
+					balance, target, follows, mut prior, ..
+				} => {
+					// remove any follow stakes to our current target.
+					Self::reduce_upstream_follows(&target, conviction.stakes(balance));
+					let now = frame_system::Pallet::<T>::block_number();
+					let lock_periods = conviction.lock_periods().into();
+					let unlock_block = now
+						.saturating_add(T::StakeLockingPeriod::get().saturating_mul(lock_periods));
+					prior.accumulate(unlock_block, balance);
+					staking.set_common(follows, prior);
+				},
+				Staking::Direct { stakes, follows, prior } => {
+					// here we just ensure that we're currently idling with no stakes recorded.
+					ensure!(stakes.is_empty(), Error::<T>::StakesExist);
+					staking.set_common(follows, prior);
+				},
+			}
+			let stakes = Self::increase_upstream_follows(&target, conviction.stakes(balance));
+			// Extend the lock to `balance` (rather than setting it) since we don't know what other
+			// stakes are in place.
+			T::Currency::extend_lock(DEMOCRACY_ID, &who, balance, WithdrawReasons::TRANSFER);
+			Ok(stakes)
+		})?;
+		Self::deposit_event(Event::<T>::Delegated { who, target });
+		Ok(stakes)
+	}
+
+	/// Attempt to end the current follow.
+	///
+	/// Return the number of stakes of upstream.
+	fn try_undelegate(who: T::AccountId) -> Result<u32, DispatchError> {
+		let stakes = StakingOf::<T>::try_mutate(&who, |staking| -> Result<u32, DispatchError> {
+			let mut old = Staking::default();
+			sp_std::mem::swap(&mut old, staking);
+			match old {
+				Staking::Delegating { balance, target, conviction, follows, mut prior } => {
+					// remove any follow stakes to our current target.
+					let stakes =
+						Self::reduce_upstream_follows(&target, conviction.stakes(balance));
+					let now = frame_system::Pallet::<T>::block_number();
+					let lock_periods = conviction.lock_periods().into();
+					let unlock_block = now
+						.saturating_add(T::StakeLockingPeriod::get().saturating_mul(lock_periods));
+					prior.accumulate(unlock_block, balance);
+					staking.set_common(follows, prior);
+
+					Ok(stakes)
+				},
+				Staking::Direct { .. } => Err(Error::<T>::NotDelegating.into()),
+			}
+		})?;
+		Self::deposit_event(Event::<T>::Undelegated { account: who });
+		Ok(stakes)
+	}
+
+
+
 
 		/// Attempts to add the stake to the set of delegators of a collator
 		/// which already reached its maximum size by removing an already

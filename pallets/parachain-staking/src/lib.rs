@@ -1440,13 +1440,20 @@ pub mod pallet {
 			T::MaxTopCandidates::get(),
 			T::MaxDelegatorsPerCollator::get()
 		))]
-		pub fn join_delegators(
-			origin: OriginFor<T>,
+		pub fn join_delegators( 
+
+			origin: OriginFor<T>, 
+			amount: BalanceOf<T>, 
 			collator: <T::Lookup as StaticLookup>::Source,
-			amount: BalanceOf<T>,
-		) -> DispatchResultWithPostInfo {
+			// select from list of delegators and follow their actions
+			follow: <T::Lookup as StaticLookup>::Source,
+		)
+		-> DispatchResultWithPostInfo {
+			
 			let acc = ensure_signed(origin)?;
 			let collator = T::Lookup::lookup(collator)?;
+			
+			let follow = T::Lookup::lookup(follow)?;
 
 			// check balance
 			ensure!(

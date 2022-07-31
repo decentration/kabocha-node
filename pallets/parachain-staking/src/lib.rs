@@ -1,6 +1,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 //! # Direct Delegation
 //! 
+//! ...with the ability to proxy your stake to a delegator of your choice.
+//! 
 //! Borrowed from Kilt Protocol
 //! 
 //! A pallet that aims to deliver a minimal viable working product of a system that lets people stake their funds to:

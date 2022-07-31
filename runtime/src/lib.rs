@@ -9,7 +9,8 @@ include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 mod weights;
 pub mod xcm_config;
 
-use cumulus_pallet_parachain_system::RelayNumberStrictlyIncreases;
+
+use cumulus_pallet_parachain_system::{RelayNumberStrictlyIncreases};
 use smallvec::smallvec;
 use sp_api::impl_runtime_apis;
 use sp_core::{crypto::KeyTypeId, OpaqueMetadata};
@@ -41,6 +42,7 @@ use frame_system::{
 pub use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 pub use sp_runtime::{MultiAddress, Perbill, Permill};
 use xcm_config::{XcmConfig, XcmOriginToTransactDispatchOrigin};
+use constants::{self, KAB, MILLIKAB};
 
 #[cfg(any(feature = "std", test))]
 pub use sp_runtime::BuildStorage;
@@ -304,8 +306,37 @@ impl frame_system::Config for Runtime {
 	type MaxConsumers = frame_support::traits::ConstU32<16>;
 }
 
+impl parachain_staking::Config for Runtime {
+type Event = Event;
+	type Currency = Balances;
+	type CurrencyBalance = Balance;
+
+	type MinBlocksPerRound = constants::staking::MinBlocksPerRound;
+	type DefaultBlocksPerRound = constants::staking::DefaultBlocksPerRound;
+	type StakeDuration = constants::staking::StakeDuration;
+	type ExitQueueDelay = constants::staking::ExitQueueDelay;
+	type MinCollators = constants::staking::MinCollators;
+	type MinRequiredCollators = constants::staking::MinRequiredCollators;
+	type MaxDelegationsPerRound = constants::staking::MaxDelegationsPerRound;
+	type MaxDelegatorsPerCollator = constants::staking::MaxDelegatorsPerCollator;
+	type MaxCollatorsPerDelegator = constants::staking::MaxCollatorsPerDelegator;
+	type MinCollatorStake = constants::staking::MinCollatorStake;
+	type MinCollatorCandidateStake = constants::staking::MinCollatorStake;
+	type MaxTopCandidates = constants::staking::MaxCollatorCandidates;
+	type MinDelegation = constants::staking::MinDelegatorStake;
+	type MinDelegatorStake = constants::staking::MinDelegatorStake;
+	type MaxUnstakeRequests = constants::staking::MaxUnstakeRequests;
+	type NetworkRewardRate = constants::staking::NetworkRewardRate;
+	type NetworkRewardStart = constants::staking::NetworkRewardStart;
+
+	type NetworkRewardBeneficiary = ();
+	type WeightInfo = weights::parachain_staking::WeightInfo<Runtime>;
+
+	const BLOCKS_PER_YEAR: Self::BlockNumber = constants::BLOCKS_PER_YEAR;
+}
+
 parameter_types! {
-	pub const MinimumPeriod: u64 = SLOT_DURATION / 2;
+	pub const MinimumPeriod: u64 = constants::SLOT_DURATION / 2;
 }
 
 impl pallet_timestamp::Config for Runtime {
@@ -313,7 +344,7 @@ impl pallet_timestamp::Config for Runtime {
 	type Moment = u64;
 	type OnTimestampSet = ();
 	type MinimumPeriod = MinimumPeriod;
-	type WeightInfo = ();
+	type WeightInfo = weights::pallet_timestamp::WeightInfo<Runtime>;
 }
 
 parameter_types! {
@@ -454,11 +485,6 @@ impl pallet_collator_selection::Config for Runtime {
 	type WeightInfo = ();
 }
 
-/// Configure the pallet template in pallets/template.
-impl parachain_staking::Config for Runtime {
-	type Event = Event;
-}
-
 // Create the runtime by composing the FRAME pallets that were previously configured.
 construct_runtime!(
 	pub enum Runtime where
@@ -485,14 +511,16 @@ construct_runtime!(
 		Aura: pallet_aura::{Pallet, Storage, Config<T>} = 23,
 		AuraExt: cumulus_pallet_aura_ext::{Pallet, Storage, Config} = 24,
 
+		// Parachain-Staking
+		ParachainStaking: parachain_staking::{Pallet, Call, Storage, Event<T>}  = 25,
+
 		// XCM helpers.
 		XcmpQueue: cumulus_pallet_xcmp_queue::{Pallet, Call, Storage, Event<T>} = 30,
 		PolkadotXcm: pallet_xcm::{Pallet, Call, Event<T>, Origin, Config} = 31,
 		CumulusXcm: cumulus_pallet_xcm::{Pallet, Event<T>, Origin} = 32,
 		DmpQueue: cumulus_pallet_dmp_queue::{Pallet, Call, Storage, Event<T>} = 33,
 
-		// Template
-		ParachainStaking: parachain_staking::{Pallet, Call, Storage, Event<T>}  = 40,
+		Treasury: pallet_treasury = 35,
 	}
 );
 

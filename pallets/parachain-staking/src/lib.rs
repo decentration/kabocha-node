@@ -127,7 +127,8 @@ pub(crate) mod tests;
 mod inflation;
 mod set;
 mod types;
-
+mod conviction;
+pub use conviction::Conviction;
 use frame_support::pallet;
 
 pub use crate::{default_weights::WeightInfo, pallet::*};
@@ -309,6 +310,9 @@ pub mod pallet {
 		type WeightInfo: WeightInfo;
 
 		const BLOCKS_PER_YEAR: Self::BlockNumber;
+
+		#[pallet::constant]
+		type MaxStake: Get<u32>;
 	}
 
 	#[pallet::error]
@@ -400,6 +404,11 @@ pub mod pallet {
 		StakeNotFound,
 		/// Cannot unlock when Unstaked is empty.
 		UnstakingIsEmpty,
+		/// Already following delegator
+		AlreadyFollowingDelegator
+		/// Already unfollowing delegator
+		AlreadyUnfollowedDelegator
+		
 	}
 
 	#[pallet::event]
@@ -462,14 +471,7 @@ pub mod pallet {
 		/// account, amount of funds staked in the replace delegation, collator
 		/// candidate's account, new total amount of delegators' funds staked
 		/// for the collator candidate\]
-		DelegationReplaced(
-			T::AccountId,
-			BalanceOf<T>,
-			T::AccountId,
-			BalanceOf<T>,
-			T::AccountId,
-			BalanceOf<T>,
-		),
+		DelegationReplaced(T::AccountId, BalanceOf<T>, T::AccountId, BalanceOf<T>, T::AccountId, BalanceOf<T>),
 		/// An account has stopped delegating a collator candidate.
 		/// \[account, collator candidate's account, old amount of delegators'
 		/// funds staked, new amount of delegators' funds staked\]
@@ -488,6 +490,10 @@ pub mod pallet {
 		/// \[round number, first block in the current round, old value, new
 		/// value\]
 		BlocksPerRoundSet(SessionIndex, T::BlockNumber, T::BlockNumber, T::BlockNumber),
+		/// An account has delegated their vote to another account.
+		Followed { who: T::AccountId, target: T::AccountId },
+		/// An account has cancelled a previous delegation operation.
+		Unfollowed { account: T::AccountId },
 	}
 
 	#[pallet::hooks]
@@ -2345,6 +2351,183 @@ pub mod pallet {
 
 			collators.try_into().expect("Did not extend Collators q.e.d.")
 		}
+
+		/// Follow the delegator pointing your balance to their delegators account
+		///
+		/// The balance delegated is locked for as long as it's delegated.
+		///
+		/// The dispatch origin of this call must be _Signed_, and the signing account must be delegating already
+		///  
+		/// - `to`: The account whose staking the `target` account's staking power will follow.
+		///
+		/// - `balance`: The amount of the account's balance to be used in delegating. This must not
+		///   be more than the account's current balance.
+		///
+		/// Emits `Followed`.
+		///
+		/// Weight: `O(R)` where R is the number of referendums the voter delegating to has
+		///   voted on. Weight is charged as if maximum stakes.
+		// NOTE: weight must cover an incorrect staking of origin with max stakes, this is ensure
+		// because a valid follow cover decoding a direct staking with max stakes.
+		#[pallet::weight(T::WeightInfo::follow(T::MaxStake::get()))]
+		pub fn follow(
+			origin: OriginFor<T>,
+			to: T::AccountId,
+			conviction: Conviction,
+			balance: BalanceOf<T>,
+			
+		) -> DispatchResultWithPostInfo {
+			let who = ensure_signed(origin)?;
+			let stake = Self::try_follow(who, to, conviction, balance)?;
+
+			Ok(Some(T::WeightInfo::follow(stake)).into())
+		}
+
+		/// Undfollow the delegator
+		///
+		/// The dispatch origin of this call must be _Signed_ and the signing account must be
+		/// currently following a delegator.
+		///
+		/// Emits `Unfollowed`.
+		///
+		/// Weight: `O(R)` where R is the number of referendums the voter delegating to has
+		///   voted on. Weight is charged as if maximum stakes.
+		// NOTE: weight must cover an incorrect staking of origin with max stakes, this is ensure
+		// because a valid follow cover decoding a direct staking with max stakes.
+		#[pallet::weight(T::WeightInfo::unfollow(T::MaxStake::get()))]
+		pub fn unfollow(origin: OriginFor<T>) -> DispatchResultWithPostInfo {
+			let who = ensure_signed(origin)?;
+			let stake = Self::try_unfollow(who)?;
+			Ok(Some(T::WeightInfo::unfollow(stake)).into())
+		}
+
+
+
+	/// Return the number of stakes for `who`
+	fn increase_upstream_follows(who: &T::AccountId, amount: Delegations<BalanceOf<T>>) -> u32 {
+		StakingOf::<T>::mutate(who, |staking| match staking {
+			Staking::Delegating { follows, .. } => {
+				// We don't support second level delegating, so we don't need to do anything more.
+				*follows = follows.saturating_add(amount);
+				1
+			},
+			Staking::Direct { stakes, follows, .. } => {
+				*follows = follows.saturating_add(amount);
+				for &(ref_index, account_vote) in stakes.iter() {
+					if let AccountStake::Standard { vote, .. } = account_vote {
+						ReferendumInfoOf::<T>::mutate(ref_index, |maybe_info| {
+							if let Some(ReferendumInfo::Ongoing(ref mut status)) = maybe_info {
+								status.tally.increase(vote.aye, amount);
+							}
+						});
+					}
+				}
+				stakes.len() as u32
+			},
+		})
+	}
+
+	/// Return the number of stakes for `who`
+	fn reduce_upstream_follows(who: &T::AccountId, amount: Delegations<BalanceOf<T>>) -> u32 {
+		StakingOf::<T>::mutate(who, |staking| match staking {
+			Staking::Delegating { follows, .. } => {
+				// We don't support second level delegating, so we don't need to do anything more.
+				*follows = follows.saturating_sub(amount);
+				1
+			},
+			Staking::Direct { stakes, follows, .. } => {
+				*follows = follows.saturating_sub(amount);
+				for &(ref_index, account_vote) in stakes.iter() {
+					if let AccountStake::Standard { vote, .. } = account_vote {
+						ReferendumInfoOf::<T>::mutate(ref_index, |maybe_info| {
+							if let Some(ReferendumInfo::Ongoing(ref mut status)) = maybe_info {
+								status.tally.reduce(vote.aye, amount);
+							}
+						});
+					}
+				}
+				stakes.len() as u32
+			},
+		})
+	}
+
+	/// Attempt to delegate `balance` times `conviction` of staking power from `who` to `target`.
+	///
+	/// Return the upstream number of stakes.
+	fn try_follow(
+		who: T::AccountId,
+		target: T::AccountId,
+		balance: BalanceOf<T>,
+	) -> Result<u32, DispatchError> {
+		ensure!(who != target, Error::<T>::Nonsense);
+		ensure!(balance <= T::Currency::free_balance(&who), Error::<T>::InsufficientFunds);
+		let stake = StakingOf::<T>::try_mutate(&who, |staking| -> Result<u32, DispatchError> {
+			let mut old = Staking::Delegating {
+				balance,
+				target: target.clone(),
+				follows: Default::default(),
+				prior: Default::default(),
+			};
+			sp_std::mem::swap(&mut old, staking);
+			match old {
+				Staking::Delegating {
+					balance, target, follows, mut prior, ..
+				} => {
+					// remove any follow stakes to our current target.
+					Self::reduce_upstream_follows(&target, conviction.stakes(balance));
+					let now = frame_system::Pallet::<T>::block_number();
+					let lock_periods = conviction.lock_periods().into();
+					let unlock_block = now
+						.saturating_add(T::StakeLockingPeriod::get().saturating_mul(lock_periods));
+					prior.accumulate(unlock_block, balance);
+					staking.set_common(follows, prior);
+				},
+				Staking::Direct { stakes, follows, prior } => {
+					// here we just ensure that we're currently idling with no stakes recorded.
+					ensure!(stakes.is_empty(), Error::<T>::StakesExist);
+					staking.set_common(follows, prior);
+				},
+			}
+			let stakes = Self::increase_upstream_follows(&target, conviction.stakes(balance));
+			// Extend the lock to `balance` (rather than setting it) since we don't know what other
+			// stakes are in place.
+			T::Currency::extend_lock(DEMOCRACY_ID, &who, balance, WithdrawReasons::TRANSFER);
+			Ok(stakes)
+		})?;
+		Self::deposit_event(Event::<T>::Delegated { who, target });
+		Ok(stakes)
+	}
+
+	/// Attempt to end the current follow.
+	///
+	/// Return the number of stakes of upstream.
+	fn try_undelegate(who: T::AccountId) -> Result<u32, DispatchError> {
+		let stakes = StakingOf::<T>::try_mutate(&who, |staking| -> Result<u32, DispatchError> {
+			let mut old = Staking::default();
+			sp_std::mem::swap(&mut old, staking);
+			match old {
+				Staking::Delegating { balance, target, conviction, follows, mut prior } => {
+					// remove any follow stakes to our current target.
+					let stakes =
+						Self::reduce_upstream_follows(&target, conviction.stakes(balance));
+					let now = frame_system::Pallet::<T>::block_number();
+					let lock_periods = conviction.lock_periods().into();
+					let unlock_block = now
+						.saturating_add(T::StakeLockingPeriod::get().saturating_mul(lock_periods));
+					prior.accumulate(unlock_block, balance);
+					staking.set_common(follows, prior);
+
+					Ok(stakes)
+				},
+				Staking::Direct { .. } => Err(Error::<T>::NotDelegating.into()),
+			}
+		})?;
+		Self::deposit_event(Event::<T>::Undelegated { account: who });
+		Ok(stakes)
+	}
+
+
+
 
 		/// Attempts to add the stake to the set of delegators of a collator
 		/// which already reached its maximum size by removing an already

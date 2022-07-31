@@ -88,6 +88,43 @@ impl<AccountId: Ord, Balance: PartialEq + Ord> Ord for Stake<AccountId, Balance>
 	}
 }
 
+/// Amount of stake and capital to follow the delegator for an account.
+#[derive(Encode, Decode, Default, Copy, Clone, PartialEq, Eq, RuntimeDebug, TypeInfo)]
+pub struct Follows<Balance> {
+	/// The number of votes (this is post-conviction).
+	pub votes: Balance,
+	/// The amount of raw capital, used for the turnout.
+	pub capital: Balance,
+}
+
+impl<Balance: Saturating> Saturating for Follows<Balance> {
+	fn saturating_add(self, o: Self) -> Self {
+		Self {
+			votes: self.votes.saturating_add(o.votes),
+			capital: self.capital.saturating_add(o.capital),
+		}
+	}
+
+	fn saturating_sub(self, o: Self) -> Self {
+		Self {
+			votes: self.votes.saturating_sub(o.votes),
+			capital: self.capital.saturating_sub(o.capital),
+		}
+	}
+
+	fn saturating_mul(self, o: Self) -> Self {
+		Self {
+			votes: self.votes.saturating_mul(o.votes),
+			capital: self.capital.saturating_mul(o.capital),
+		}
+	}
+
+	fn saturating_pow(self, exp: usize) -> Self {
+		Self { votes: self.votes.saturating_pow(exp), capital: self.capital.saturating_pow(exp) }
+	}
+}
+
+
 /// The activity status of the collator.
 #[derive(Copy, Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, TypeInfo, MaxEncodedLen)]
 pub enum CandidateStatus {
@@ -364,7 +401,7 @@ pub struct TotalStake<Balance: Default> {
 /// The number of delegations a delegator has done within the last session in
 /// which they delegated.
 #[derive(Default, Clone, Encode, Decode, RuntimeDebug, PartialEq, TypeInfo, MaxEncodedLen)]
-pub struct DelegationCounter {
+pub struct FollowCounter {
 	/// The index of the last delegation.
 	pub round: SessionIndex,
 	/// The number of delegations made within round.
